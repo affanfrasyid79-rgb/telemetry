@@ -1202,14 +1202,16 @@
                 attribution: '© OpenStreetMap'
             }).addTo(map);
 
-            const carIcon = L.divIcon({
-                html: '<i class="fas fa-car" style="font-size:28px;color:#2f00ff;text-shadow:0 0 12px rgba(47,0,255,0.8);"></i>',
-                className: 'custom-car-icon',
-                iconSize: [28, 28],
-                iconAnchor: [14, 14]
+            // ========== UBAH: Ikon mobil diganti dengan titik lingkaran biru ==========
+            // Hanya menggunakan marker lingkaran sederhana
+            const dotIcon = L.divIcon({
+                html: '<div style="width:12px;height:12px;background:#2f00ff;border-radius:50%;border:2px solid #00ff88;box-shadow:0 0 10px rgba(47,0,255,0.8);"></div>',
+                className: 'custom-dot-icon',
+                iconSize: [12, 12],
+                iconAnchor: [6, 6]
             });
 
-            marker = L.marker([lat, lng], { icon: carIcon }).addTo(map);
+            marker = L.marker([lat, lng], { icon: dotIcon }).addTo(map);
             circle = L.circle([lat, lng], {
                 radius: 50,
                 color: '#2f00ff',
@@ -1499,7 +1501,6 @@
         function updateSpeed(val) {
             const numVal = parseInt(val);
             
-            // CEK: Apakah ini data valid?
             const isDataValid = !isNaN(numVal) && val !== null && val !== '';
             
             if (isDataValid) {
@@ -1853,11 +1854,11 @@
             document.getElementById('statusDot').className = 'dot online';
             document.getElementById('statusText').textContent = 'ONLINE';
 
-            // Subscribe HANYA ke topic urban (tanpa proto)
+            // Subscribe ke topic urban
             client.subscribe('location/urban/coordinates', err => {
                 if (err) console.error('Subscribe error:', err);
             });
-            client.subscribe('semeru/urban/#'); // Subscribe ke semua topic urban
+            client.subscribe('semeru/urban/#');
             
             console.log('📡 Subscribed to urban topics only');
         });
@@ -1896,7 +1897,6 @@
             }
             
             // ===== SENSOR DATA HANDLER =====
-            // HANYA PROSES DATA LENGKAP (JSON) untuk menghindari blink
             if (topic === 'semeru/urban/data') {
                 try {
                     const data = JSON.parse(value);
@@ -1932,12 +1932,8 @@
                 } catch (e) {
                     console.log('JSON Parse Error:', e);
                 }
-                return; // STOP di sini, jangan proses topic individual
+                return;
             }
-            
-            // ===== IGNORE TOPIC INDIVIDUAL (speed, rpm, dll) =====
-            // Topic individual diabaikan untuk menghindari multiple update
-            // if (topic === 'semeru/urban/speed') ... TIDAK DIPROSES
         });
 
         // ========== INITIALIZE ==========
