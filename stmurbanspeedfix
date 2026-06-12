@@ -28,48 +28,73 @@ const float c2 = 0.000234125;
 const float c3 = 0.0000000876741;
 
 // ================================================================
-// KONSTANTA VSS — PRINSIP BENDA KAKU (RIGID BODY ROTATION)
-// REF: [1] Gillespie (1992) Fundamentals of Vehicle Dynamics, SAE
-//      [2] Wong (2001) Theory of Ground Vehicles 3rd Ed, Wiley
-//      [3] Maxim AN4494 Wheel Speed Sensor Signal Conditioning
+// KONSTANTA VSS — SENSOR MAGNET DI VELG, KECEPATAN DARI BAN
+// ================================================================
+// PRINSIP:
+//   Magnet dipasang di velg pada lingkaran PCD → sensor membaca
+//   frekuensi rotasi velg. Karena velg & ban adalah satu benda
+//   kaku (rigid body), kecepatan sudut ω sama. Namun jarak maju
+//   kendaraan per rotasi ditentukan oleh KELILING BAN (yang
+//   menyentuh tanah), bukan keliling velg PCD.
 //
-// Velg & ban = satu benda kaku → ω sama [Ref 1]
-// Sensor magnet di VELG membaca ω roda via hitungan pulsa.
-// Kecepatan maju = ω × r_ban → perlu faktor koreksi D_ban/D_velg
-// Faktor koreksi = 0.561 / 0.417 = 1.3453
-// JARAK_PER_PULSA = (KELILING_VELG / N) × FAKTOR_KOREKSI = 0.4406 m/pulsa
-// v_kmh = JARAK_PER_PULSA × 3600 / T = 1586.2 / T
+// ALUR PERHITUNGAN:
+//   T          = interval antar pulsa (ms)
+//   N          = 4  (jumlah magnet)
+//
+//   ① RPM_pulsa  = 60000 / T                      (pulsa/menit)
+//   ② RPM_roda   = RPM_pulsa / N                  (putaran roda/menit)
+//   ③ v (m/min)  = RPM_roda × KELILING_VELG × FAKTOR_KOREKSI
+//                = RPM_roda × KELILING_BAN        (ekuivalen)
+//   ④ v (km/h)  = v (m/min) × 60 / 1000
+//               = KONSTANTA_KMH / T
+//
+// FAKTOR KOREKSI:
+//   FAKTOR = D_ban / D_velg_PCD = 0.570 / 0.417 = 1.3669
+//   → Tanpa koreksi ini kecepatan akan under-read ~26.8%
+//
+// KONSTANTA FINAL:
+//   KONSTANTA_KMH = (KELILING_VELG / N) × FAKTOR × 3600
+//                 = JARAK_PER_PULSA × 3600
+//                 = 0.4472 m/pulsa × 3600 = 1609.9
+//   → v_kmh = 1609.9 / T
+//
+// VALIDASI:
+//   v = 10 km/h → T = 160.9 ms
+//   v = 60 km/h → T =  26.8 ms
+//   v = 150km/h → T =  10.7 ms
 // ================================================================
 
-const int   JUMLAH_MAGNET     = 4;
-const float DIAMETER_VELG_PCD = 0.417;
-const float KELILING_VELG     = DIAMETER_VELG_PCD * 3.14159265;
-const float DIAMETER_BAN      = 0.570;
-const float FAKTOR_KOREKSI_BAN_VELG = DIAMETER_BAN / DIAMETER_VELG_PCD;
-const float JARAK_PER_PULSA = (KELILING_VELG / JUMLAH_MAGNET) * FAKTOR_KOREKSI_BAN_VELG;
-
-const unsigned long INTERVAL_MIN_MS  = 10;
-const unsigned long INTERVAL_MAX_MS  = 5000;
-const unsigned long SPEED_TIMEOUT_MS = 3000;
-
-const int MAX_SPEED_JUMP = 5;  // km/h per pulsa
+const int   JUMLAH_MAGNET           = 4;
+const float DIAMETER_VELG_PCD       = 0.417;                             // m — PCD lingkaran magnet di velg
+const float KELILING_VELG           = DIAMETER_VELG_PCD * 3.14159265f;   // m — 1.3090 m/putaran
+const float DIAMETER_BAN            = 0.570;                             // m — diameter luar ban (menyentuh tanah)
+const float FAKTOR_KOREKSI_BAN_VELG = DIAMETER_BAN / DIAMETER_VELG_PCD; // 1.3669
+const float JARAK_PER_PULSA         = (KELILING_VELG / JUMLAH_MAGNET) * FAKTOR_KOREKSI_BAN_VELG;
+                                                                          // 0.4472 m/pulsa
+const float KONSTANTA_KMH           = JARAK_PER_PULSA * 3600.0f;        // 1609.9 — v_kmh = KONSTANTA_KMH / T
 
 // ================================================================
-// FIXED MOVING AVERAGE — selalu menggunakan hingga 5 sampel terakhir
+// VALIDASI INTERVAL PULSA
 // ================================================================
-const int MAX_AVG_SAMPLES = 5;
+const unsigned long INTERVAL_MIN_MS  = 1;    // ~150 km/h batas atas
+const unsigned long INTERVAL_MAX_MS  = 500;  // batas bawah sebelum dianggap berhenti
+const unsigned long SPEED_TIMEOUT_MS = 3000;  // tidak ada pulsa 3 detik → reset ke 0
+
+// Debounce VSS — harus unsigned long agar perbandingan dengan millis() tidak salah tipe
+const unsigned long VSS_DEBOUNCE_MS  = 1;     // ms — cukup untuk noise sensor IR
 
 // ========== Global ==========
-int   g_rpm  = 0;
-float g_tps  = 0.0;
-float g_vbat = 0.0;
+int   g_rpm           = 0;
+float g_tps           = 0.0;
+float g_vbat          = 0.0;
 int   g_kecepatan     = 0;
 int   g_kecepatan_raw = 0;
-float g_afr  = 0.0;
-int   g_suhu = 0;
+float g_afr           = 0.0;
+int   g_suhu          = 0;
+int   raw_RPM_VSS     = 0;
 
 String currentLine = "";
-bool ecuConnected = false;
+bool ecuConnected  = false;
 unsigned long lastEcuData = 0;
 unsigned long lastPing    = 0;
 
@@ -81,10 +106,10 @@ unsigned long lastDebounceTimeVSS = 0;
 unsigned long endTimeVSS          = 0;
 unsigned long startTimeVSS        = 0;
 
-// ========== Buffer kecepatan (fixed 5 sampel) ==========
-int kecepatanBuffer[MAX_AVG_SAMPLES] = {0};
-int kecepatanBufferIndex  = 0;
-int kecepatanBufferFilled = 0;
+// ========== Buffer kecepatan — moving average 5 sampel ==========
+int  kecepatanBuffer[5] = {0};
+int  kecBufIndex        = 0;
+bool kecBufFilled       = false;
 
 // ========== Buffer suhu ==========
 float suhuBuffer[10] = {0};
@@ -97,15 +122,23 @@ unsigned long lastArduinoSend = 0;
 unsigned long packetCounter   = 0;
 unsigned long startTime       = 0;
 
-// ================================================================
-// VSS DEBOUNCE THRESHOLD [Ref 3 — Maxim AN4494]
-// Debounce ≈ 10% interval pulsa di batas atas tiap rentang kecepatan
-// ================================================================
-unsigned long getDebounceThreshold(int kecepatan_kmh) {
-  if (kecepatan_kmh <= 10) return 16;
-  if (kecepatan_kmh <= 25) return 6;
-  if (kecepatan_kmh <= 35) return 5;
-  return 2;
+// =====================================================
+// Moving Average Kecepatan
+// =====================================================
+int smoothKecepatan(int rawVal) {
+  kecepatanBuffer[kecBufIndex++] = rawVal;
+
+  if (kecBufIndex >= 5) {
+    kecBufIndex  = 0;
+    kecBufFilled = true;
+  }
+
+  int samples = kecBufFilled ? 5 : (kecBufIndex == 0 ? 1 : kecBufIndex);
+
+  long sum = 0;
+  for (int i = 0; i < samples; i++) sum += kecepatanBuffer[i];
+
+  return (int)(sum / samples);
 }
 
 // =====================================================
@@ -233,32 +266,6 @@ void handshakeECU() {
 // Sensor
 // =====================================================
 
-// ----------------------------------------------------------------
-// updateKecepatanAverage — FIXED MOVING AVERAGE
-// Selalu menggunakan hingga MAX_AVG_SAMPLES (5) sampel terbaru.
-// Jika buffer belum penuh, dipakai sebanyak sampel yang tersedia.
-// ----------------------------------------------------------------
-void updateKecepatanAverage(int kecepatanBaru) {
-  g_kecepatan_raw = kecepatanBaru;
-
-  kecepatanBuffer[kecepatanBufferIndex++] = kecepatanBaru;
-  if (kecepatanBufferIndex >= MAX_AVG_SAMPLES) {
-    kecepatanBufferIndex  = 0;
-    kecepatanBufferFilled = 1;
-  }
-
-  int tersedia = kecepatanBufferFilled
-                 ? MAX_AVG_SAMPLES
-                 : (kecepatanBufferIndex == 0 ? 1 : kecepatanBufferIndex);
-
-  long sum = 0;
-  for (int i = 0; i < tersedia; i++) {
-    int idx = (kecepatanBufferIndex - 1 - i + MAX_AVG_SAMPLES) % MAX_AVG_SAMPLES;
-    sum += kecepatanBuffer[idx];
-  }
-  g_kecepatan = (int)(sum / tersedia);
-}
-
 void bacaSuhu() {
   const int N = 20;
   long sum = 0;
@@ -329,6 +336,7 @@ void kirimJSON() {
   doc["suhu"]          = g_suhu;
   doc["ecu_connected"] = ecuConnected;
   doc["packet"]        = packetCounter++;
+  doc["raw_rpm_vss"]   = raw_RPM_VSS;
 
   JsonObject waktu = doc.createNestedObject("waktu");
   waktu["menit"] = menit;
@@ -383,8 +391,11 @@ void loop() {
       g_rpm  = random(1200, 9000);
       g_tps  = random(0, 100);
       g_vbat = random(120, 145) / 10.0;
+
       int kecepatanBaru = random(0, 60);
-      updateKecepatanAverage(kecepatanBaru);
+      g_kecepatan_raw   = kecepatanBaru;
+      g_kecepatan       = smoothKecepatan(kecepatanBaru);
+
       g_afr  = random(800, 1500) / 100.0;
       g_suhu = random(60, 110);
       ecuConnected = true;
@@ -399,32 +410,58 @@ void loop() {
     return;
   }
 
-  // ================= VSS =================
+  // ================================================================
+  // VSS — Perhitungan kecepatan dari sensor magnet di velg
+  //        dikoreksi ke kecepatan maju menggunakan diameter ban
+  // ================================================================
   int currentSwitchState = digitalRead(IRSensorPin);
 
+  // Deteksi perubahan state → catat waktu untuk debounce
   if (currentSwitchState != lastInputStateVSS) {
     lastDebounceTimeVSS = now;
   }
 
-  unsigned long debounceThreshold = getDebounceThreshold(g_kecepatan);
-
-  if ((now - lastDebounceTimeVSS) > debounceThreshold) {
+  // Debounce: tunggu sinyal stabil selama VSS_DEBOUNCE_MS
+  // (unsigned long vs unsigned long — tidak ada bug tipe seperti kode 2 lama)
+  if ((now - lastDebounceTimeVSS) > VSS_DEBOUNCE_MS) {
     if (currentSwitchState != inputStateVSS) {
       inputStateVSS = currentSwitchState;
 
+      // Proses hanya pada rising edge (LOW → HIGH)
       if (inputStateVSS == HIGH) {
         startTimeVSS = lastDebounceTimeVSS;
         unsigned long interval = startTimeVSS - endTimeVSS;
 
+        // Validasi interval: buang pulsa terlalu cepat (noise) atau terlalu lambat
         if (interval >= INTERVAL_MIN_MS && interval <= INTERVAL_MAX_MS) {
 
-          // v_kmh = JARAK_PER_PULSA × 3600 / T = 1586.2 / T
-          float kecepatanBaru = (JARAK_PER_PULSA * 3600.0f) / (float)interval;
+          // ============================================================
+          // PERHITUNGAN KECEPATAN
+          //
+          // Sensor di velg membaca frekuensi rotasi velg.
+          // Karena velg & ban satu benda kaku, putaran/menit sama.
+          // Kecepatan maju = RPM_roda × KELILING_BAN
+          //                = RPM_roda × KELILING_VELG × FAKTOR_KOREKSI
+          //
+          // Diringkas menjadi satu konstanta:
+          //   v_kmh = KONSTANTA_KMH / interval
+          //         = 1609.9 / interval
+          //
+          // Di mana KONSTANTA_KMH = JARAK_PER_PULSA × 3600
+          //         JARAK_PER_PULSA = (KELILING_VELG / N) × FAKTOR_KOREKSI
+          // ============================================================
 
-          if (abs((int)kecepatanBaru - g_kecepatan) <= MAX_SPEED_JUMP
-              || g_kecepatan == 0) {
-            updateKecepatanAverage((int)kecepatanBaru);
-          }
+          // RPM pulsa (untuk debug/logging)
+          raw_RPM_VSS = (int)(60000UL / interval);
+
+          // Kecepatan langsung dari konstanta — tidak perlu konversi bertahap
+          int rawKec = (int)(KONSTANTA_KMH / (float)interval);
+
+          // Simpan raw sebelum smoothing
+          g_kecepatan_raw = rawKec;
+
+          // Moving average 5 sampel untuk tampilan yang stabil
+          g_kecepatan = smoothKecepatan(rawKec);
         }
 
         endTimeVSS = startTimeVSS;
@@ -434,12 +471,13 @@ void loop() {
 
   lastInputStateVSS = currentSwitchState;
 
-  // Speed timeout: tidak ada pulsa 3 detik → reset ke 0
+  // Speed timeout: tidak ada pulsa selama SPEED_TIMEOUT_MS → kendaraan berhenti
   if (endTimeVSS > 0 && (now - endTimeVSS) > SPEED_TIMEOUT_MS) {
-    g_kecepatan           = 0;
-    g_kecepatan_raw       = 0;
-    kecepatanBufferIndex  = 0;
-    kecepatanBufferFilled = 0;
+    g_kecepatan     = 0;
+    g_kecepatan_raw = 0;
+    raw_RPM_VSS     = 0;
+    kecBufIndex     = 0;
+    kecBufFilled    = false;
     memset(kecepatanBuffer, 0, sizeof(kecepatanBuffer));
     endTimeVSS = 0;
   }
