@@ -76,12 +76,12 @@ const float KONSTANTA_KMH           = JARAK_PER_PULSA * 3600.0f;        // 1609.
 // ================================================================
 // VALIDASI INTERVAL PULSA
 // ================================================================
-const unsigned long INTERVAL_MIN_MS  = 1;    // ~150 km/h batas atas
+const unsigned long INTERVAL_MIN_MS  = 0.3;   
 const unsigned long INTERVAL_MAX_MS  = 1000;  // batas bawah sebelum dianggap berhenti
 const unsigned long SPEED_TIMEOUT_MS = 3000;  // tidak ada pulsa 3 detik → reset ke 0
 
 // Debounce VSS — harus unsigned long agar perbandingan dengan millis() tidak salah tipe
-const unsigned long VSS_DEBOUNCE_MS  = 1;     // ms — cukup untuk noise sensor IR
+const unsigned long VSS_DEBOUNCE_MS  = 0.3;     
 
 // ========== Global ==========
 int   g_rpm           = 0;
