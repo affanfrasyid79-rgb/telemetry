@@ -1,0 +1,537 @@
+#include <Adafruit_GFX.h>
+#include <MCUFRIEND_kbv.h>
+
+MCUFRIEND_kbv tft;
+
+// ── Warna ────────────────────────────────────────────────────
+#define C_BG        0x0000
+#define C_CARD      0x0861
+#define C_TRACK     0x18C3
+#define C_BORDER    0x2965
+
+#define C_WHITE     0xFFFF
+#define C_LGRAY     0x8C51
+#define C_DGRAY     0x2965
+#define C_YELLOW    0xEFE0
+#define C_RED       0xF800
+#define C_ORANGE    0xFC00
+#define C_GREEN     0x07E0
+#define C_LIME      0xAFE5
+#define C_CYAN      0x07FF
+#define C_BLUE_C    0x065F
+#define C_PURPLE    0xA81F
+#define C_PURP2     0xC81F
+
+// ── Dimensi layar ────────────────────────────────────────────
+#define SW 320
+#define SH 240
+
+// ── Layout ───────────────────────────────────────────────────
+#define MG 3
+
+#define HDR_Y  0
+#define HDR_H  20
+
+#define SPD_Y  21
+#define SPD_H  48
+
+// Kolom 3 bagian
+// KIRI   = GEAR  (angka 1–7 dari STM32)
+// TENGAH = SPEED (km/h)
+// KANAN  = RPM
+#define COL_GEAR_X  0
+#define COL_GEAR_W  107
+#define DIV1_X      107
+#define COL_SPD_X   108
+#define COL_SPD_W   104
+#define DIV2_X      212
+#define COL_RPM_X   213
+#define COL_RPM_W   107
+
+#define BIG_Y       (SPD_Y + 2)
+#define BIG_H       40
+#define SEPARATOR_Y (BIG_Y + BIG_H + 2)
+
+#define RPM_Y     (SEPARATOR_Y + 3)
+#define RPM_H     22
+
+#define SEC1_Y    (RPM_Y + RPM_H + 5)
+#define SEC1_H    42
+
+#define SEC2_Y    (SEC1_Y + SEC1_H + 2)
+#define SEC2_H    42
+
+#define BOT_Y     (SEC2_Y + SEC2_H + 2)
+#define BOT_H     46
+#define BOT_W     154
+
+// ── Variabel sensor ──────────────────────────────────────────
+int   kecepatan = 0, rpm = 0, tps = 0, suhu = 0;
+float vBatt     = 0.0;
+int   gearNum   = 1;   // gear dari STM32, range 1–7
+
+// Guard (last values) — cegah redraw jika tidak berubah
+int   lSpd  = -999, lRpm = -999, lTps = -999, lSuhu = -999;
+float lVb   = -999.0;
+int   lGear = -999;
+
+// ── Konversi gear ke string tampilan ─────────────────────────
+// gear 1–7 → "1"–"7"
+void gearToStr(int g, char* buf) {
+  buf[0] = '0' + constrain(g, 1, 7);
+  buf[1] = '\0';
+}
+
+// ── Serial buffer ────────────────────────────────────────────
+// Format data masuk: "kecepatan;rpm;tps;suhu;vbatt;gear\n"
+#define BUF_MAX 64
+char    rxBuf[BUF_MAX];
+uint8_t rxIdx = 0;
+
+unsigned long lastDataMs    = 0;
+unsigned long lapStart      = 0;
+unsigned long lastTimerDraw = 0;
+unsigned long lastDummy     = 0;
+
+// ── Variabel demo (saat tidak ada data Serial) ───────────────
+int   dSpd = 0, dRpm = 0, dTps = 0, dSuhu = 75, dGear = 1;
+float dVb  = 13.5;
+int   dDir = 1;
+
+bool wasInDummy = true;
+
+// ============================================================
+//  SETUP
+// ============================================================
+void setup() {
+  Serial.begin(9600);
+  uint16_t id = tft.readID();
+  if (id == 0xD3D3) id = 0x9341;
+  tft.begin(id);
+  tft.setRotation(3);
+  drawLayout();
+
+  // ── Reset tampilan GEAR ke "1" setiap kali LCD/board di-reset ──
+  gearNum = 1;
+  dGear   = 1;
+  updateGear(1);   // lGear masih -999 di sini, jadi pasti tergambar
+
+  lapStart = millis();
+}
+
+// ============================================================
+//  LOOP
+// ============================================================
+void loop() {
+  // ── Baca Serial dari STM32 ───────────────────────────────────
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (rxIdx > 0) {
+        rxBuf[rxIdx] = '\0';
+        parseData(rxBuf);
+        rxIdx = 0;
+      }
+    } else {
+      if (rxIdx < BUF_MAX - 1) rxBuf[rxIdx++] = c;
+      else rxIdx = 0;
+    }
+  }
+
+  // ── Timer tiap 100 ms ────────────────────────────────────────
+  if (millis() - lastTimerDraw >= 100) {
+    lastTimerDraw = millis();
+    drawTimer();
+  }
+
+  // ── Mode demo / live ─────────────────────────────────────────
+  bool noData = (lastDataMs == 0 || millis() - lastDataMs > 2000);
+  if (noData) {
+    if (!wasInDummy) {
+      lSpd=-999; lRpm=-999; lTps=-999; lSuhu=-999; lVb=-999.0; lGear=-999;
+      wasInDummy = true;
+    }
+    if (millis() - lastDummy >= 60) {
+      lastDummy = millis();
+      tickDummy();
+    }
+  } else {
+    if (wasInDummy) {
+      lSpd=-999; lRpm=-999; lTps=-999; lSuhu=-999; lVb=-999.0; lGear=-999;
+      wasInDummy = false;
+    }
+  }
+
+  checkConn();
+  delay(4);
+}
+
+// ============================================================
+//  DUMMY TICKER — animasi saat tidak ada data live
+// ============================================================
+void tickDummy() {
+  dSpd += dDir * 2;
+  dRpm  = map(dSpd, 0, 200, 800, 5400);
+  dTps  = map(dSpd, 0, 200, 5, 100);
+  dVb   = 13.5 - (float)dSpd / 400.0;
+
+  // Simulasi naik gear 1→7 saat naik, turun 7→1 saat turun
+  dGear = map(dSpd, 0, 200, 1, 7);
+  dGear = constrain(dGear, 1, 7);
+
+  if (dSpd >= 200) dDir = -1;
+  if (dSpd <= 0)   dDir =  1;
+
+  // Urutan WAJIB: RPM dulu → Speed → Gear → lainnya
+  updateRPM(dRpm);
+  updateSpeed(dSpd);
+  updateGear(dGear);
+  updateTPS(dTps);
+  updateSuhu(dSuhu);
+  updateVBatt(dVb);
+}
+
+// ============================================================
+//  LAYOUT STATIS — dipanggil sekali di setup()
+// ============================================================
+void drawLayout() {
+  tft.fillScreen(C_BG);
+
+  // Header bar
+  tft.fillRect(0, HDR_Y, SW, HDR_H, C_CARD);
+  tft.drawFastHLine(0, HDR_H, SW, C_BORDER);
+  tft.setTextSize(1);
+  tft.setTextColor(C_RED, C_CARD);
+  tft.setCursor(MG+1, HDR_Y+6);
+  tft.print("AKASA");
+  tft.setTextColor(C_BLUE_C, C_CARD);
+  tft.print(" EVO 2");
+
+  // Timer placeholder
+  tft.setTextColor(C_LGRAY, C_CARD);
+  tft.setCursor(143, HDR_Y+6);
+  tft.print("00:00.0");
+
+  // Dot koneksi (merah = tidak ada data)
+  tft.fillCircle(SW-7, HDR_Y+10, 4, C_RED);
+
+  // Garis vertikal pemisah kolom atas
+  tft.drawFastVLine(DIV1_X, SPD_Y, SPD_H - 2, C_BORDER);
+  tft.drawFastVLine(DIV2_X, SPD_Y, SPD_H - 2, C_BORDER);
+
+  // Garis separator double-line
+  tft.drawFastHLine(0, SEPARATOR_Y,     SW, C_BORDER);
+  tft.drawFastHLine(0, SEPARATOR_Y + 2, SW, C_TRACK);
+
+  // Label RPM bar
+  tft.setTextSize(1);
+  tft.setTextColor(C_DGRAY, C_BG);
+  tft.setCursor(MG, RPM_Y+2);
+  tft.print("RPM");
+  tft.setCursor(SW-45, RPM_Y+2);
+  tft.print("/5500");
+  drawRpmLedsEmpty();
+
+  // Section THROTTLE & TEMPERATURE
+  drawSectionLabelWithLedBar(SEC1_Y, "THROTTLE",    C_PURPLE);
+  drawSectionLabelWithLedBar(SEC2_Y, "TEMPERATURE", C_CYAN);
+
+  // Card baterai
+  drawCard(MG, BOT_Y, BOT_W, BOT_H);
+  tft.setTextColor(C_DGRAY, C_CARD);
+  tft.setCursor(MG+4, BOT_Y+4);
+  tft.print("BATTERY");
+
+  // Card status
+  int sx = MG + BOT_W + 4;
+  drawCard(sx, BOT_Y, BOT_W, BOT_H);
+  tft.setTextColor(C_DGRAY, C_CARD);
+  tft.setCursor(sx+4, BOT_Y+4);
+  tft.print("STATUS");
+  tft.setTextColor(C_LGRAY, C_CARD);
+  tft.setCursor(sx+4, BOT_Y+16);
+  tft.print("DEMO MODE");
+  tft.setTextColor(C_DGRAY, C_CARD);
+  tft.setCursor(sx+4, BOT_Y+28);
+  tft.print("STM32->UNO");
+}
+
+void drawCard(int x, int y, int w, int h) {
+  tft.fillRect(x, y, w, h, C_CARD);
+  tft.drawRect(x, y, w, h, C_BORDER);
+}
+
+void drawSectionLabelWithLedBar(int y, const char* lbl, uint16_t accentCol) {
+  tft.fillRect(MG, y, 2, SEC1_H-1, accentCol);
+  tft.setTextColor(accentCol, C_BG);
+  tft.setTextSize(1);
+  tft.setCursor(MG+5, y+2);
+  tft.print(lbl);
+  int segW      = (SW - MG*2 - 19*2) / 20;
+  int totalBarW = 20 * segW + 19 * 2;
+  tft.fillRect(MG, y + 18, totalBarW, 12, C_TRACK);
+}
+
+void drawRpmLedsEmpty() {
+  int lw = (SW - MG*2 - 19*2) / 20;
+  int ly = RPM_Y + RPM_H - 10;
+  for (int i = 0; i < 20; i++)
+    tft.fillRect(MG + i*(lw+2), ly, lw, 10, C_TRACK);
+}
+
+// ── Cetak angka/huruf besar di tengah kolom ──────────────────
+void printBigNum(int colX, int colW, int y, const char* buf, uint16_t col) {
+  int len = strlen(buf);
+  int charW5 = 6 * 5;
+  if (len * charW5 <= colW) {
+    tft.setTextSize(5);
+    tft.setTextColor(col, C_BG);
+    tft.setCursor(colX + (colW - len * charW5) / 2, y);
+    tft.print(buf);
+  } else {
+    int charW4 = 6 * 4;
+    tft.setTextSize(4);
+    tft.setTextColor(col, C_BG);
+    tft.setCursor(colX + (colW - len * charW4) / 2, y + 4);
+    tft.print(buf);
+  }
+}
+
+// ============================================================
+//  UPDATE FUNCTIONS
+// ============================================================
+
+// ── GEAR — kolom KIRI ────────────────────────────────────────
+// Menerima angka 1–7 langsung dari STM32
+// Warna: normal=cyan, RPM tinggi=kuning, RPM kritis=merah
+void updateGear(int g) {
+  g = constrain(g, 1, 7);
+  if (g == lGear) return;
+  lGear = g;
+
+  float rr = (float)rpm / 5500.0;
+  uint16_t col;
+  if      (rr > 0.90) col = C_RED;
+  else if (rr > 0.78) col = C_YELLOW;
+  else                col = C_CYAN;
+
+  tft.fillRect(COL_GEAR_X, BIG_Y, COL_GEAR_W, BIG_H, C_BG);
+  char buf[3];
+  gearToStr(g, buf);
+  printBigNum(COL_GEAR_X, COL_GEAR_W, BIG_Y, buf, col);
+
+  // Kolom kiri: restore hanya DIV1
+  tft.drawFastVLine(DIV1_X, SPD_Y, SPD_H - 2, C_BORDER);
+  tft.drawFastHLine(0, SEPARATOR_Y,     SW, C_BORDER);
+  tft.drawFastHLine(0, SEPARATOR_Y + 2, SW, C_TRACK);
+}
+
+// ── SPEED — kolom TENGAH ─────────────────────────────────────
+// Warna mengikuti RPM global — panggil updateRPM() lebih dulu
+void updateSpeed(int val) {
+  val = constrain(val, 0, 999);
+  if (val == lSpd) return;
+  lSpd = val;
+
+  float rr = (float)rpm / 5500.0;
+  uint16_t col = C_WHITE;
+  if      (rr > 0.90) col = C_RED;
+  else if (rr > 0.78) col = C_YELLOW;
+
+  tft.fillRect(COL_SPD_X, BIG_Y, COL_SPD_W, BIG_H, C_BG);
+  char buf[4];
+  sprintf(buf, "%d", val);
+  printBigNum(COL_SPD_X, COL_SPD_W, BIG_Y, buf, col);
+
+  // Kolom tengah: restore DIV1 + DIV2
+  tft.drawFastVLine(DIV1_X, SPD_Y, SPD_H - 2, C_BORDER);
+  tft.drawFastVLine(DIV2_X, SPD_Y, SPD_H - 2, C_BORDER);
+  tft.drawFastHLine(0, SEPARATOR_Y,     SW, C_BORDER);
+  tft.drawFastHLine(0, SEPARATOR_Y + 2, SW, C_TRACK);
+}
+
+// ── RPM — kolom KANAN + LED bar ──────────────────────────────
+void updateRPM(int val) {
+  val = constrain(val, 0, 9999);
+  if (val == lRpm) return;
+  lRpm = val;
+
+  float rr = (float)val / 5500.0;
+  uint16_t col = (rr > 0.90) ? C_RED : (rr > 0.78) ? C_YELLOW : C_GREEN;
+
+  tft.fillRect(COL_RPM_X, BIG_Y, COL_RPM_W, BIG_H, C_BG);
+  char buf[5];
+  sprintf(buf, "%d", val);
+  printBigNum(COL_RPM_X, COL_RPM_W, BIG_Y, buf, col);
+
+  // Kolom kanan: restore DIV2
+  tft.drawFastVLine(DIV2_X, SPD_Y, SPD_H - 2, C_BORDER);
+
+  // LED bar RPM — 20 segmen, hijau→kuning→merah
+  int lw  = (SW - MG*2 - 19*2) / 20;
+  int ly  = RPM_Y + RPM_H - 10;
+  int lit = map(constrain(val, 0, 5500), 0, 5500, 0, 20);
+  for (int i = 0; i < 20; i++) {
+    float r = (float)i / 20.0;
+    uint16_t ledCol = C_TRACK;
+    if (i < lit) ledCol = (r < 0.60) ? C_GREEN : (r < 0.85) ? C_YELLOW : C_RED;
+    tft.fillRect(MG + i*(lw+2), ly, lw, 10, ledCol);
+  }
+
+  // Restore label RPM
+  tft.setTextSize(1);
+  tft.setTextColor(C_DGRAY, C_BG);
+  tft.setCursor(MG, RPM_Y+2);     tft.print("RPM");
+  tft.setCursor(SW-45, RPM_Y+2);  tft.print("/5500");
+}
+
+// ── TPS — bar SEC1 ───────────────────────────────────────────
+void updateTPS(int val) {
+  val = constrain(val, 0, 100);
+  if (val == lTps) return;
+  lTps = val;
+
+  uint16_t col = (val < 30) ? C_PURPLE : (val < 70) ? C_PURP2 : C_RED;
+  int segW = (SW - MG*2 - 19*2) / 20;
+  if (segW < 2) segW = 2;
+  int lit = constrain(map(val, 0, 100, 0, 20), 0, 20);
+  if (val == 0) lit = 0;
+  int barY = SEC1_Y + 18;
+
+  for (int i = 0; i < 20; i++) {
+    float r = (float)i / 20.0;
+    uint16_t segCol = C_TRACK;
+    if (i < lit) segCol = (r < 0.30) ? C_PURPLE : (r < 0.70) ? C_PURP2 : C_RED;
+    tft.fillRect(MG + i*(segW+2), barY, segW, 12, segCol);
+  }
+
+  tft.fillRect(SW-52, SEC1_Y, 50, 16, C_BG);
+  tft.setTextSize(1);
+  tft.setTextColor(col, C_BG);
+  tft.setCursor(SW-52, SEC1_Y+2);
+  char buf[7];
+  sprintf(buf, "%3d %%", val);
+  tft.print(buf);
+}
+
+// ── SUHU — bar SEC2 ──────────────────────────────────────────
+void updateSuhu(int val) {
+  val = constrain(val, 0, 150);
+  if (val == lSuhu) return;
+  lSuhu = val;
+
+  int segW = (SW - MG*2 - 19*2) / 20;
+  if (segW < 2) segW = 2;
+  int pct  = constrain(map(val, 10, 100, 0, 100), 0, 100);
+  int lit  = (val <= 10) ? 0 : constrain(map(pct, 0, 100, 0, 20), 0, 20);
+  int barY = SEC2_Y + 18;
+
+  for (int i = 0; i < 20; i++) {
+    float tv = map(i, 0, 19, 20, 120);
+    uint16_t segCol = C_TRACK;
+    if (i < lit) segCol = (tv < 70) ? C_BLUE_C : (tv < 90) ? C_ORANGE : C_RED;
+    tft.fillRect(MG + i*(segW+2), barY, segW, 12, segCol);
+  }
+
+  tft.fillRect(SW-52, SEC2_Y, 50, 16, C_BG);
+  tft.setTextSize(1);
+  uint16_t col = (val < 70) ? C_BLUE_C : (val < 90) ? C_ORANGE : C_RED;
+  tft.setTextColor(col, C_BG);
+  tft.setCursor(SW-52, SEC2_Y+2);
+  char buf[8];
+  sprintf(buf, "%dC", val);
+  tft.print(buf);
+}
+
+// ── BATERAI ──────────────────────────────────────────────────
+void updateVBatt(float val) {
+  if (val > lVb - 0.05 && val < lVb + 0.05) return;
+  lVb = val;
+
+  int iw = BOT_W - 8;
+  tft.fillRect(MG+4, BOT_Y+14, iw, 14, C_CARD);
+  tft.setTextSize(1);
+  tft.setTextColor(C_YELLOW, C_CARD);
+  tft.setCursor(MG+4, BOT_Y+16);
+  char buf[8];
+  dtostrf(val, 5, 2, buf);
+  tft.print(buf); tft.print('V');
+
+  int sw2 = (iw-9)/10, sh = 6;
+  int sy  = BOT_Y + BOT_H - sh - 4;
+  int lit = constrain(map((int)(val*10), 100, 142, 0, 10), 0, 10);
+  for (int i = 0; i < 10; i++) {
+    uint16_t col = C_TRACK;
+    if (i < lit) col = (i<3) ? C_RED : (i<7) ? C_YELLOW : C_GREEN;
+    tft.fillRect(MG+4 + i*(sw2+1), sy, sw2, sh, col);
+  }
+}
+
+// ── TIMER ────────────────────────────────────────────────────
+void drawTimer() {
+  unsigned long ms = millis() - lapStart;
+  uint8_t m = ms/60000, s=(ms%60000)/1000, d=(ms%1000)/100;
+  tft.fillRect(143, HDR_Y+4, 58, 11, C_CARD);
+  tft.setTextSize(1);
+  tft.setTextColor(C_LGRAY, C_CARD);
+  tft.setCursor(143, HDR_Y+6);
+  char buf[10];
+  sprintf(buf, "%02d:%02d.%d", m, s, d);
+  tft.print(buf);
+}
+
+// ── STATUS KONEKSI ───────────────────────────────────────────
+void checkConn() {
+  static bool lConn = false;
+  bool conn = (lastDataMs > 0 && millis() - lastDataMs < 3000);
+  if (conn == lConn) return;
+  lConn = conn;
+
+  tft.fillCircle(SW-7, HDR_Y+10, 4, conn ? C_GREEN : C_RED);
+
+  int sx = MG + BOT_W + 4;
+  tft.fillRect(sx+4, BOT_Y+14, BOT_W-8, 12, C_CARD);
+  tft.setTextSize(1);
+  tft.setTextColor(conn ? C_GREEN : C_RED, C_CARD);
+  tft.setCursor(sx+4, BOT_Y+16);
+  tft.print(conn ? "LIVE DATA" : "DEMO MODE");
+}
+
+// ── PARSE DATA DARI STM32 ────────────────────────────────────
+// Format: "kecepatan;rpm;tps;suhu;vbatt;gear\n"
+// Contoh: "85;3200;65;78;13.2;3\n"
+// gear = 1–7
+void parseData(char* data) {
+  char tmp[BUF_MAX];
+  strncpy(tmp, data, BUF_MAX-1);
+  tmp[BUF_MAX-1] = '\0';
+
+  char* tok1 = strtok(tmp,  ";");  // kecepatan
+  char* tok2 = strtok(NULL, ";");  // rpm
+  char* tok3 = strtok(NULL, ";");  // tps
+  char* tok4 = strtok(NULL, ";");  // suhu
+  char* tok5 = strtok(NULL, ";");  // vbatt
+  char* tok6 = strtok(NULL, ";");  // gear (1–7)
+
+  if (!tok1||!tok2||!tok3||!tok4||!tok5) return;
+
+  kecepatan = atoi(tok1);
+  rpm       = atoi(tok2);
+  tps       = atoi(tok3);
+  suhu      = atoi(tok4);
+  vBatt     = atof(tok5);
+  gearNum   = tok6 ? constrain(atoi(tok6), 1, 7) : 1;
+
+  lastDataMs = millis();
+
+  // Urutan WAJIB: RPM dulu → Speed → Gear → sisanya
+  updateRPM(rpm);
+  updateSpeed(kecepatan);
+  updateGear(gearNum);
+  updateTPS(tps);
+  updateSuhu(suhu);
+  updateVBatt(vBatt);
+
+  // Flash dot hijau sesaat saat data masuk
+  tft.fillCircle(SW-7, HDR_Y+10, 4, C_LIME);
+}
