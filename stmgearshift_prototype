@@ -1,0 +1,596 @@
+#include <Arduino.h>
+#include <ArduinoJson.h>
+#include <math.h>
+
+#define MONITOR_BAUD      115200
+#define ECU_BAUD          57600
+#define SIMULATE          false
+#define KEEP_ALIVE_MS     6000
+#define ECU_TIMEOUT_MS    3000
+#define ECU_RETRY_MS      2000
+#define SEND_INTERVAL     500
+#define ARDUINO_INTERVAL  100
+
+// ========== PIN ==========
+const int IRSensorPin   = PB8;
+const int ThermistorPin = PA5;
+const int sensorAFR     = PA1;
+const int GearShiftPin  = PB9;   // limit switch upshift -> ke GND, pakai INPUT_PULLUP
+
+// ========== Serial ==========
+HardwareSerial ecuSerial(PA3, PA2);
+HardwareSerial SerialESP(PA10, PA9);
+HardwareSerial SerialArduino(PB10);
+
+// ========== Konstanta ECU & Sensor ==========
+const float R1 = 9800.0;
+const float c1 = 0.001129148;
+const float c2 = 0.000234125;
+const float c3 = 0.0000000876741;
+
+// ================================================================
+// KONSTANTA VSS — SENSOR MAGNET DI VELG, KECEPATAN DARI BAN
+// ================================================================
+// PRINSIP:
+//   Magnet dipasang di velg pada lingkaran PCD → sensor membaca
+//   frekuensi rotasi velg. Karena velg & ban adalah satu benda
+//   kaku (rigid body), kecepatan sudut ω sama. Namun jarak maju
+//   kendaraan per rotasi ditentukan oleh KELILING BAN (yang
+//   menyentuh tanah), bukan keliling velg PCD.
+//
+// ALUR PERHITUNGAN:
+//   T          = interval antar pulsa (ms)
+//   N          = 4  (jumlah magnet)
+//
+//   ① RPM_pulsa  = 60000 / T                      (pulsa/menit)
+//   ② RPM_roda   = RPM_pulsa / N                  (putaran roda/menit)
+//   ③ v (m/min)  = RPM_roda × KELILING_VELG × FAKTOR_KOREKSI
+//                = RPM_roda × KELILING_BAN        (ekuivalen)
+//   ④ v (km/h)  = v (m/min) × 60 / 1000
+//               = KONSTANTA_KMH / T
+//
+// FAKTOR KOREKSI:
+//   FAKTOR = D_ban / D_velg_PCD = 0.570 / 0.417 = 1.3669
+//   → Tanpa koreksi ini kecepatan akan under-read ~26.8%
+//
+// KONSTANTA FINAL:
+//   KONSTANTA_KMH = (KELILING_VELG / N) × FAKTOR × 3600
+//                 = JARAK_PER_PULSA × 3600
+//                 = 0.4472 m/pulsa × 3600 = 1609.9
+//   → v_kmh = 1609.9 / T
+//
+// VALIDASI:
+//   v = 10 km/h → T = 160.9 ms
+//   v = 60 km/h → T =  26.8 ms
+//   v = 150km/h → T =  10.7 ms
+// ================================================================
+
+const int   JUMLAH_MAGNET           = 4;
+const float DIAMETER_VELG_PCD       = 0.417;                             // m — PCD lingkaran magnet di velg
+const float KELILING_VELG           = DIAMETER_VELG_PCD * 3.14159265f;   // m — 1.3090 m/putaran
+const float DIAMETER_BAN            = 0.570;                             // m — diameter luar ban (menyentuh tanah)
+const float FAKTOR_KOREKSI_BAN_VELG = DIAMETER_BAN / DIAMETER_VELG_PCD; // 1.3669
+const float JARAK_PER_PULSA         = (KELILING_VELG / JUMLAH_MAGNET) * FAKTOR_KOREKSI_BAN_VELG;
+                                                                          // 0.4472 m/pulsa
+const float KONSTANTA_KMH           = JARAK_PER_PULSA * 3600.0f;        // 1609.9 — v_kmh = KONSTANTA_KMH / T
+
+// ================================================================
+// VALIDASI INTERVAL PULSA
+// ================================================================
+const unsigned long INTERVAL_MIN_MS  = 0.3;   
+const unsigned long INTERVAL_MAX_MS  = 1000;  // batas bawah sebelum dianggap berhenti
+const unsigned long SPEED_TIMEOUT_MS = 3000;  // tidak ada pulsa 3 detik → reset ke 0
+
+// Debounce VSS — harus unsigned long agar perbandingan dengan millis() tidak salah tipe
+const unsigned long VSS_DEBOUNCE_MS  = 0.3;     
+
+// ================================================================
+// GEAR SHIFT — limit switch upshift di PB9
+// ================================================================
+// Limit switch terpasang antara PB9 dan GND.
+// Pin dikonfigurasi INPUT_PULLUP -> idle = HIGH.
+// Saat limit switch ditekan (upshift) -> LOW.
+// Gear bertambah 1 setiap falling edge (HIGH -> LOW) yang lolos
+// debounce, dan dibatasi maksimal MAX_GEAR (tidak wrap ke 1).
+// ================================================================
+const int MAX_GEAR = 7;
+const int MIN_GEAR = 1;
+const unsigned long GEAR_DEBOUNCE_MS = 30;   // debounce mekanis, lebih lama dari VSS
+
+int g_gear = MIN_GEAR;
+
+int  lastGearSwitchState   = HIGH;  // idle = HIGH karena INPUT_PULLUP
+int  gearSwitchState       = HIGH;
+unsigned long lastGearDebounceTime = 0;
+
+// ========== Global ==========
+int   g_rpm           = 0;
+float g_tps           = 0.0;
+float g_vbat          = 0.0;
+int   g_kecepatan     = 0;
+int   g_kecepatan_raw = 0;
+float g_afr           = 0.0;
+int   g_suhu          = 0;
+int   raw_RPM_VSS     = 0;
+
+String currentLine = "";
+bool ecuConnected  = false;
+unsigned long lastEcuData = 0;
+unsigned long lastPing    = 0;
+
+// ========== VSS ==========
+int inputStateVSS     = LOW;
+int lastInputStateVSS = LOW;
+
+unsigned long lastDebounceTimeVSS = 0;
+unsigned long endTimeVSS          = 0;
+unsigned long startTimeVSS        = 0;
+
+// ========== Buffer kecepatan — moving average 5 sampel ==========
+int  kecepatanBuffer[5] = {0};
+int  kecBufIndex        = 0;
+bool kecBufFilled       = false;
+
+// ========== Buffer suhu ==========
+float suhuBuffer[10] = {0};
+int bufferIndex  = 0;
+int bufferFilled = 0;
+
+// ========== Timing ==========
+unsigned long lastSend        = 0;
+unsigned long lastArduinoSend = 0;
+unsigned long packetCounter   = 0;
+unsigned long startTime       = 0;
+
+// =====================================================
+// Moving Average Kecepatan
+// =====================================================
+int smoothKecepatan(int rawVal) {
+  kecepatanBuffer[kecBufIndex++] = rawVal;
+
+  if (kecBufIndex >= 5) {
+    kecBufIndex  = 0;
+    kecBufFilled = true;
+  }
+
+  int samples = kecBufFilled ? 5 : (kecBufIndex == 0 ? 1 : kecBufIndex);
+
+  long sum = 0;
+  for (int i = 0; i < samples; i++) sum += kecepatanBuffer[i];
+
+  return (int)(sum / samples);
+}
+
+// =====================================================
+// GEAR SHIFT — cek limit switch upshift (PB9)
+// =====================================================
+void cekGearShift() {
+  unsigned long now = millis();
+  int reading = digitalRead(GearShiftPin);
+
+  // Deteksi perubahan state -> catat waktu untuk debounce
+  if (reading != lastGearSwitchState) {
+    lastGearDebounceTime = now;
+  }
+
+  // Debounce: tunggu sinyal stabil selama GEAR_DEBOUNCE_MS
+  if ((now - lastGearDebounceTime) > GEAR_DEBOUNCE_MS) {
+    if (reading != gearSwitchState) {
+      gearSwitchState = reading;
+
+      // Falling edge (HIGH -> LOW) = limit switch ditekan -> upshift
+      if (gearSwitchState == LOW) {
+        if (g_gear < MAX_GEAR) {
+          g_gear++;
+        }
+        // Sudah di MAX_GEAR -> tetap di gear 7, tidak wrap ke 1
+      }
+    }
+  }
+
+  lastGearSwitchState = reading;
+}
+
+// =====================================================
+// ECU
+// =====================================================
+
+void sendCmd(const char* cmd) {
+  ecuSerial.print(cmd);
+  ecuSerial.println();
+  ecuSerial.flush();
+}
+
+String getField(const String &s, int fieldNum) {
+  int start = 0;
+  for (int i = 0; i < fieldNum; i++) {
+    start = s.indexOf(';', start);
+    if (start == -1) return "";
+    start++;
+  }
+  int end = s.indexOf(';', start);
+  if (end == -1) end = s.length();
+  String field = s.substring(start, end);
+  field.trim();
+  return field;
+}
+
+String cleanString(const String &s) {
+  String out = "";
+  out.reserve(s.length());
+  for (int i = 0; i < (int)s.length(); i++) {
+    char c = s.charAt(i);
+    if (c >= 32 && c <= 126) out += c;
+  }
+  return out;
+}
+
+bool isNumeric(const String &s) {
+  if (s.length() == 0) return false;
+  int start = 0;
+  if (s.charAt(0) == '-') start = 1;
+  bool hasDot = false;
+  for (int i = start; i < (int)s.length(); i++) {
+    char c = s.charAt(i);
+    if (c == '.') {
+      if (hasDot) return false;
+      hasDot = true;
+    } else if (c < '0' || c > '9') {
+      return false;
+    }
+  }
+  return true;
+}
+
+float parseFloat(const String &s, float defaultVal, float minVal, float maxVal) {
+  if (!isNumeric(s)) return defaultVal;
+  float val = s.toFloat();
+  if (val < minVal || val > maxVal) return defaultVal;
+  return val;
+}
+
+int parseInt(const String &s, int defaultVal, int minVal, int maxVal) {
+  if (!isNumeric(s)) return defaultVal;
+  int val = s.toInt();
+  if (val < minVal || val > maxVal) return defaultVal;
+  return val;
+}
+
+void parseECU(const String &rawLine) {
+  String line = cleanString(rawLine);
+  if (line.length() < 10) return;
+  if (line.indexOf(';') == -1) return;
+
+  String lineLower = line;
+  lineLower.toLowerCase();
+  int headerIdx = lineLower.indexOf("a603;");
+  if (headerIdx == -1) return;
+
+  String data = line.substring(headerIdx);
+  int fieldCount = 1;
+  for (int i = 0; i < (int)data.length(); i++) {
+    if (data.charAt(i) == ';') fieldCount++;
+  }
+  if (fieldCount < 5) return;
+
+  String fTPS  = getField(data, 1);
+  String fVBAT = getField(data, 2);
+  String fRPM  = getField(data, 4);
+
+  float newTPS  = parseFloat(fTPS,  g_tps,  0.0, 100.0);
+  float newVBAT = parseFloat(fVBAT, g_vbat, 6.0, 20.0);
+  int   newRPM  = parseInt(fRPM,    g_rpm,  0,   20000);
+
+  if (ecuConnected && abs(newRPM - g_rpm) > 8000) return;
+
+  g_tps  = newTPS;
+  g_vbat = newVBAT;
+  g_rpm  = newRPM;
+
+  ecuConnected = true;
+  lastEcuData  = millis();
+}
+
+void handshakeECU() {
+  sendCmd("1B00");
+  delay(150);
+  while (ecuSerial.available()) ecuSerial.read();
+
+  sendCmd("1617");
+  delay(200);
+  while (ecuSerial.available()) {
+    char c = ecuSerial.read();
+    if (c == '\n') { currentLine = ""; break; }
+    else if (c != '\r') currentLine += c;
+  }
+
+  currentLine = "";
+  sendCmd("160A");
+  delay(50);
+
+  lastPing    = millis();
+  lastEcuData = millis();
+}
+
+// =====================================================
+// Sensor
+// =====================================================
+
+void bacaSuhu() {
+  const int N = 20;
+  long sum = 0;
+  for (int i = 0; i < N; i++) {
+    sum += analogRead(ThermistorPin);
+    delay(2);
+  }
+  float Vo    = sum / (float)N;
+  float R2    = R1 * (4095.0 / Vo - 1.0);
+  float logR2 = log(R2);
+  float T     = 1.0 / (c1 + c2 * logR2 + c3 * logR2 * logR2 * logR2);
+  float mentah = T - 273.15;
+
+  suhuBuffer[bufferIndex++] = mentah;
+  if (bufferIndex >= 10) { bufferIndex = 0; bufferFilled = 1; }
+
+  int samples = bufferFilled ? 10 : (bufferIndex == 0 ? 1 : bufferIndex);
+  float sum2 = 0;
+  for (int i = 0; i < samples; i++) sum2 += suhuBuffer[i];
+  g_suhu = (int)round(sum2 / samples);
+}
+
+void bacaAFR() {
+  const int N = 10;
+  long sum = 0;
+  for (int i = 0; i < N; i++) {
+    sum += analogRead(sensorAFR);
+    delay(1);
+  }
+  float volt       = (sum / (float)N) * (3.3 / 4095.0);
+  float afr_bensin = 2.375 * volt + 7.3125;
+  float lamda      = afr_bensin / 14.7;
+  g_afr            = round(lamda * 9.12 * 100) / 100.0;
+}
+
+// =====================================================
+// KIRIM KE ARDUINO UNO
+// =====================================================
+// Format: "kecepatan;rpm;tps;suhu;vbatt;gear\n"
+void kirimKeArduino() {
+  SerialArduino.print(g_kecepatan);
+  SerialArduino.print(";");
+  SerialArduino.print(g_rpm);
+  SerialArduino.print(";");
+  SerialArduino.print((int)g_tps);
+  SerialArduino.print(";");
+  SerialArduino.print(g_suhu);
+  SerialArduino.print(";");
+  SerialArduino.print(g_vbat, 1);
+  SerialArduino.print(";");
+  SerialArduino.println(g_gear);
+}
+
+// =====================================================
+// JSON ke ESP
+// =====================================================
+
+void kirimJSON() {
+  unsigned long detik_total = millis() / 1000;
+  int menit = detik_total / 60;
+  int detik = detik_total % 60;
+
+  StaticJsonDocument<256> doc;
+  doc["rpm"]           = g_rpm;
+  doc["tps"]           = (int)g_tps;
+  doc["vbat"]          = g_vbat;
+  doc["kecepatan"]     = g_kecepatan;
+  doc["kecepatan_raw"] = g_kecepatan_raw;
+  doc["afr"]           = g_afr;
+  doc["suhu"]          = g_suhu;
+  doc["gear"]          = g_gear;
+  doc["ecu_connected"] = ecuConnected;
+  doc["packet"]        = packetCounter++;
+  doc["raw_rpm_vss"]   = raw_RPM_VSS;
+
+  JsonObject waktu = doc.createNestedObject("waktu");
+  waktu["menit"] = menit;
+  waktu["detik"] = detik;
+
+  String output;
+  serializeJson(doc, output);
+  SerialESP.println(output);
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+  Serial.begin(MONITOR_BAUD);
+  SerialESP.begin(9600);
+  SerialArduino.begin(9600);
+
+  pinMode(IRSensorPin, INPUT);
+  pinMode(sensorAFR, INPUT);
+  pinMode(GearShiftPin, INPUT_PULLUP);   // limit switch upshift
+  analogReadResolution(12);
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  startTime = millis();
+
+  if (SIMULATE) {
+    randomSeed(analogRead(PA4));
+    lastSend        = millis();
+    lastArduinoSend = millis();
+    return;
+  }
+
+  ecuSerial.begin(ECU_BAUD);
+  delay(800);
+  handshakeECU();
+
+  lastSend        = millis();
+  lastArduinoSend = millis();
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop() {
+  unsigned long now = millis();
+
+  // ================= SIMULASI =================
+  if (SIMULATE) {
+    cekGearShift();
+
+    if (now - lastSend >= SEND_INTERVAL) {
+      g_rpm  = random(1200, 9000);
+      g_tps  = random(0, 100);
+      g_vbat = random(120, 145) / 10.0;
+
+      int kecepatanBaru = random(0, 60);
+      g_kecepatan_raw   = kecepatanBaru;
+      g_kecepatan       = smoothKecepatan(kecepatanBaru);
+
+      g_afr  = random(800, 1500) / 100.0;
+      g_suhu = random(60, 110);
+      ecuConnected = true;
+
+      kirimKeArduino();
+      kirimJSON();
+
+      lastSend        = now;
+      lastArduinoSend = now;
+    }
+    delay(10);
+    return;
+  }
+
+  // ================================================================
+  // VSS — Perhitungan kecepatan dari sensor magnet di velg
+  //        dikoreksi ke kecepatan maju menggunakan diameter ban
+  // ================================================================
+  int currentSwitchState = digitalRead(IRSensorPin);
+
+  // Deteksi perubahan state → catat waktu untuk debounce
+  if (currentSwitchState != lastInputStateVSS) {
+    lastDebounceTimeVSS = now;
+  }
+
+  // Debounce: tunggu sinyal stabil selama VSS_DEBOUNCE_MS
+  // (unsigned long vs unsigned long — tidak ada bug tipe seperti kode 2 lama)
+  if ((now - lastDebounceTimeVSS) > VSS_DEBOUNCE_MS) {
+    if (currentSwitchState != inputStateVSS) {
+      inputStateVSS = currentSwitchState;
+
+      // Proses hanya pada rising edge (LOW → HIGH)
+      if (inputStateVSS == HIGH) {
+        startTimeVSS = lastDebounceTimeVSS;
+        unsigned long interval = startTimeVSS - endTimeVSS;
+
+        // Validasi interval: buang pulsa terlalu cepat (noise) atau terlalu lambat
+        if (interval >= INTERVAL_MIN_MS && interval <= INTERVAL_MAX_MS) {
+
+          // ============================================================
+          // PERHITUNGAN KECEPATAN
+          //
+          // Sensor di velg membaca frekuensi rotasi velg.
+          // Karena velg & ban satu benda kaku, putaran/menit sama.
+          // Kecepatan maju = RPM_roda × KELILING_BAN
+          //                = RPM_roda × KELILING_VELG × FAKTOR_KOREKSI
+          //
+          // Diringkas menjadi satu konstanta:
+          //   v_kmh = KONSTANTA_KMH / interval
+          //         = 1609.9 / interval
+          //
+          // Di mana KONSTANTA_KMH = JARAK_PER_PULSA × 3600
+          //         JARAK_PER_PULSA = (KELILING_VELG / N) × FAKTOR_KOREKSI
+          // ============================================================
+
+          // RPM pulsa (untuk debug/logging)
+          raw_RPM_VSS = (int)(60000UL / interval);
+
+          // Kecepatan langsung dari konstanta — tidak perlu konversi bertahap
+          int rawKec = (int)(KONSTANTA_KMH / (float)interval);
+
+          // Simpan raw sebelum smoothing
+          g_kecepatan_raw = rawKec;
+
+          // Moving average 5 sampel untuk tampilan yang stabil
+          g_kecepatan = smoothKecepatan(rawKec);
+        }
+
+        endTimeVSS = startTimeVSS;
+      }
+    }
+  }
+
+  lastInputStateVSS = currentSwitchState;
+
+  // ================= GEAR SHIFT — cek limit switch upshift =================
+  cekGearShift();
+
+  // Speed timeout: tidak ada pulsa selama SPEED_TIMEOUT_MS → kendaraan berhenti
+  if (endTimeVSS > 0 && (now - endTimeVSS) > SPEED_TIMEOUT_MS) {
+    g_kecepatan     = 0;
+    g_kecepatan_raw = 0;
+    raw_RPM_VSS     = 0;
+    kecBufIndex     = 0;
+    kecBufFilled    = false;
+    memset(kecepatanBuffer, 0, sizeof(kecepatanBuffer));
+    endTimeVSS = 0;
+  }
+
+  // ================= ECU TIMEOUT =================
+  if (ecuConnected && (now - lastEcuData > ECU_TIMEOUT_MS)) {
+    ecuConnected = false;
+    g_rpm  = 0;
+    g_tps  = 0;
+    g_vbat = 0;
+  }
+
+  // ================= ECU RECONNECT =================
+  if (!ecuConnected && (now - lastPing >= ECU_RETRY_MS)) {
+    handshakeECU();
+  }
+
+  // ================= KEEP ALIVE =================
+  if (ecuConnected && (now - lastPing >= KEEP_ALIVE_MS)) {
+    sendCmd("1B00");
+    lastPing = now;
+  }
+
+  // ================= ECU STREAM =================
+  while (ecuSerial.available()) {
+    char c = ecuSerial.read();
+    if (c == '\n' || c == '\r') {
+      if (currentLine.length() > 5) {
+        parseECU(currentLine);
+        currentLine = "";
+      }
+    } else {
+      currentLine += c;
+      if (currentLine.length() > 80) {
+        parseECU(currentLine);
+        currentLine = "";
+      }
+    }
+  }
+
+  // ================= BACA SENSOR & KIRIM KE ESP =================
+  if (now - lastSend >= SEND_INTERVAL) {
+    bacaSuhu();
+    bacaAFR();
+    kirimJSON();
+    lastSend = now;
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+  }
+
+  // ================= KIRIM KE ARDUINO UNO =================
+  if (now - lastArduinoSend >= ARDUINO_INTERVAL) {
+    kirimKeArduino();
+    lastArduinoSend = now;
+  }
+
+  delay(1);
+}
